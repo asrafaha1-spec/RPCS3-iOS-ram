@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Lets memlimit.c call memorystatus_control() to raise this process' jetsam limit.
+         Only honoured when the IPA is installed with TrollStore (CoreTrust bypass). -->
+    <key>com.apple.private.memorystatus</key>
+    <true/>
+
+    <!-- Public Apple entitlements that also raise the per-app memory ceiling. -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+    <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+    <true/>
+</dict>
+</plist>

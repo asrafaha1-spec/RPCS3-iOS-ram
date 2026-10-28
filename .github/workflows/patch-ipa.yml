@@ -1,0 +1,60 @@
+name: Patch IPA - raise memory limit
+
+# Downloads the IPA(s) from a release in this repo, injects libmemlimit.dylib,
+# adds memory entitlements and uploads "<name>-memlimit.ipa" back to the same release.
+# For TrollStore installs only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag that holds the original IPA"
+        default: "RPCS3"
+        required: true
+      limit_mb:
+        description: "Memory limit to request, in MB (3584 = 3.5 GB)"
+        default: "3584"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Download original IPA(s)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p original patched
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern "*.ipa" --dir original
+          ls -la original
+
+      - name: Patch
+        run: |
+          chmod +x patch_ipa.sh
+          shopt -s nullglob
+          for f in original/*.ipa; do
+            case "$f" in *-memlimit.ipa) continue;; esac
+            ./patch_ipa.sh "$f" "patched/$(basename "${f%.ipa}")-memlimit.ipa" "${{ inputs.limit_mb }}"
+          done
+          ls -la patched
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.tag }}" patched/*.ipa \
+            --repo "${{ github.repository }}" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patched-ipa
+          path: patched/*.ipa
