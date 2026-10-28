@@ -16,8 +16,14 @@ trap 'rm -rf "$WORK"' EXIT
 
 echo "==> Unpacking $IN"
 unzip -q "$IN" -d "$WORK/ipa"
-APP="$(find "$WORK/ipa/Payload" -maxdepth 1 -name '*.app' | head -n1)"
-[ -d "$APP" ] || { echo "no .app inside IPA" >&2; exit 1; }
+# Drop macOS metadata (AppleDouble "._*" files, __MACOSX) that some IPAs carry. A stray
+# "Payload/._Name.app" file would otherwise match the *.app search below.
+find "$WORK/ipa" -name '._*' -delete
+rm -rf "$WORK/ipa/__MACOSX"
+APP="$(find "$WORK/ipa/Payload" -maxdepth 1 -type d -name '*.app' | head -n1)"
+[ -d "$APP" ] || { echo "no .app inside IPA. Top level of Payload:" >&2; ls -la "$WORK/ipa/Payload" >&2; exit 1; }
+# The old seal would be invalid after we modify the binary; TrollStore re-signs anyway.
+rm -rf "$APP/_CodeSignature"
 EXEC_NAME="$(plutil -extract CFBundleExecutable raw "$APP/Info.plist")"
 MAIN="$APP/$EXEC_NAME"
 ARCHS="$(lipo -archs "$MAIN")"
