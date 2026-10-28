@@ -16,6 +16,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/syslog.h>
+#include <pthread.h>
+#include <time.h>
 
 #if defined(__has_include)
 #if __has_include(<os/proc.h>)
@@ -35,11 +37,24 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK 5
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT      6
 
+// Log to syslog, stderr AND <app container>/Documents/memlimit.log (visible in the Files
+// app under On My iPhone > RPCS3), because the app's own session log does not capture ours.
 static void log_msg(const char *fmt, int a, int b) {
     char line[160];
     snprintf(line, sizeof line, fmt, a, b);
     syslog(LOG_NOTICE, "[memlimit] %s", line);
     fprintf(stderr, "[memlimit] %s\n", line);
+
+    const char *home = getenv("HOME");
+    if (home) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/Documents/memlimit.log", home);
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fprintf(f, "[memlimit] %s\n", line);
+            fclose(f);
+        }
+    }
 }
 
 static long available_mb(void) {
@@ -48,6 +63,19 @@ static long available_mb(void) {
         return (long)(os_proc_available_memory() / (1024 * 1024));
 #endif
     return -1;
+}
+
+// Every 3 s, record how much memory this process may still allocate before iOS kills it.
+// The last line before a crash shows how close to the limit the app was.
+static void *monitor_thread(void *arg) {
+    (void)arg;
+    int elapsed = 0;
+    for (;;) {
+        sleep(3);
+        elapsed += 3;
+        log_msg("headroom=%dMB (t+%ds)", (int)available_mb(), elapsed);
+    }
+    return NULL;
 }
 
 // Public entry point: ask the kernel to raise this process' memory limit to `limit_mb`.
@@ -83,4 +111,8 @@ __attribute__((constructor)) static void memlimit_init(void) {
     }
     int rc = raise_memory_limit_mb(limit);
     log_msg("requested %dMB, result=%d", limit, rc);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, monitor_thread, NULL) == 0)
+        pthread_detach(t);
 }

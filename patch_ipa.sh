@@ -29,6 +29,17 @@ MAIN="$APP/$EXEC_NAME"
 ARCHS="$(lipo -archs "$MAIN")"
 echo "==> App: $(basename "$APP"), executable: $EXEC_NAME, archs: $ARCHS"
 
+# Read the ORIGINAL entitlements now, while the binary is still signed. Injecting the dylib
+# below strips the code signature, and reading afterwards returns nothing - which would
+# silently drop get-task-allow (needed to attach a debugger for JIT) and the rest.
+echo "==> Reading original entitlements"
+ldid -e "$MAIN" > "$WORK/orig-ents.plist" 2>/dev/null || true
+if [ -s "$WORK/orig-ents.plist" ]; then
+  echo "    found: $(grep -o '<key>[^<]*</key>' "$WORK/orig-ents.plist" | sed 's/<[^>]*>//g' | tr '\n' ' ')"
+else
+  echo "    WARNING: no entitlements found in the original binary; using JIT-safe fallback" >&2
+fi
+
 echo "==> Building libmemlimit.dylib (limit ${LIMIT_MB} MB)"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 ARCH_FLAGS=()
@@ -59,7 +70,6 @@ else
 fi
 
 echo "==> Merging entitlements"
-ldid -e "$MAIN" > "$WORK/orig-ents.plist" 2>/dev/null || true
 python3 - "$WORK/orig-ents.plist" "$HERE/entitlements-extra.plist" "$WORK/ents.plist" <<'PY'
 import plistlib, sys, os
 orig_p, extra_p, out_p = sys.argv[1:4]
@@ -70,9 +80,16 @@ if os.path.exists(orig_p) and os.path.getsize(orig_p) > 0:
             orig = plistlib.load(f)
     except Exception:
         orig = {}
+if not orig:
+    # Fallback: the two entitlements the original IPA is known to carry for JIT/performance.
+    orig = {"get-task-allow": True, "com.apple.developer.sustained-execution": True}
 with open(extra_p, "rb") as f:
     extra = plistlib.load(f)
 orig.update(extra)
+# Never ship a build that can't have a debugger attached; JIT enablers depend on it.
+if not orig.get("get-task-allow"):
+    print("    ERROR: get-task-allow missing; JIT would not work", file=sys.stderr)
+    sys.exit(1)
 with open(out_p, "wb") as f:
     plistlib.dump(orig, f)
 print("    entitlements:", ", ".join(sorted(orig)))
