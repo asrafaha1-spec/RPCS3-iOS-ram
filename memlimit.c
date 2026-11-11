@@ -10,6 +10,7 @@
 // NOTE: the limit is only a ceiling set for the kernel's jetsam. The device still needs
 // the physical RAM. On a 4 GB phone 3.5 GB will get killed by the system anyway.
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,9 +40,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 
 // Log to syslog, stderr AND <app container>/Documents/memlimit.log (visible in the Files
 // app under On My iPhone > RPCS3), because the app's own session log does not capture ours.
-static void log_msg(const char *fmt, int a, int b) {
-    char line[160];
-    snprintf(line, sizeof line, fmt, a, b);
+static void log_line(const char *line) {
     syslog(LOG_NOTICE, "[memlimit] %s", line);
     fprintf(stderr, "[memlimit] %s\n", line);
 
@@ -55,6 +54,23 @@ static void log_msg(const char *fmt, int a, int b) {
             fclose(f);
         }
     }
+}
+
+static void log_msg(const char *fmt, int a, int b) {
+    char line[160];
+    snprintf(line, sizeof line, fmt, a, b);
+    log_line(line);
+}
+
+// printf-style logger, also used by ramprobe.mm (same dylib, same log file).
+void memlimit_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void memlimit_logf(const char *fmt, ...) {
+    char line[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    log_line(line);
 }
 
 static long available_mb(void) {
@@ -115,4 +131,10 @@ __attribute__((constructor)) static void memlimit_init(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, monitor_thread, NULL) == 0)
         pthread_detach(t);
+
+#ifdef RAM_PROBE
+    // Experiment (see ramhelper/ramprobe.mm): only compiled in when the IPA is built with RAM_PROBE=1.
+    extern void ramprobe_start(void);
+    ramprobe_start();
+#endif
 }

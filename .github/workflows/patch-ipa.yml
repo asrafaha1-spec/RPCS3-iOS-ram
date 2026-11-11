@@ -15,6 +15,10 @@ on:
         description: "Memory limit to request, in MB (3584 = 3.5 GB)"
         default: "3584"
         required: true
+      ram_probe:
+        description: "Build the RAM helper experiment (adds RamHelper.appex; output is named -ramprobe.ipa)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,9 +45,11 @@ jobs:
         run: |
           chmod +x patch_ipa.sh
           shopt -s nullglob
+          SUFFIX="memlimit"; PROBE=0
+          if [ "${{ inputs.ram_probe }}" = "true" ]; then SUFFIX="ramprobe"; PROBE=1; fi
           for f in original/*.ipa; do
-            case "$f" in *-memlimit.ipa) continue;; esac
-            ./patch_ipa.sh "$f" "patched/$(basename "${f%.ipa}")-memlimit.ipa" "${{ inputs.limit_mb }}"
+            case "$f" in *-memlimit.ipa|*-ramprobe.ipa) continue;; esac
+            RAM_PROBE=$PROBE ./patch_ipa.sh "$f" "patched/$(basename "${f%.ipa}")-$SUFFIX.ipa" "${{ inputs.limit_mb }}"
           done
           ls -la patched
 

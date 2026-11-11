@@ -47,12 +47,39 @@ for a in $ARCHS; do
   case "$a" in arm64|arm64e) ARCH_FLAGS+=(-arch "$a");; esac
 done
 [ ${#ARCH_FLAGS[@]} -gt 0 ] || ARCH_FLAGS=(-arch arm64)
-clang "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
-  -dynamiclib -install_name "@rpath/libmemlimit.dylib" \
-  -DDEFAULT_LIMIT_MB="$LIMIT_MB" "$HERE/memlimit.c" -o "$WORK/libmemlimit.dylib"
+# RAM_PROBE=1 builds the experiment in ramhelper/: a RamHelper.appex extension plus a probe in the
+# dylib that measures whether memory lent by the helper escapes this app's memory limit.
+RAM_PROBE="${RAM_PROBE:-0}"
+if [ "$RAM_PROBE" = "1" ]; then
+  echo "==> RAM_PROBE=1: building helper extension and probe"
+  clang -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
+    -DDEFAULT_LIMIT_MB="$LIMIT_MB" -DRAM_PROBE=1 "$HERE/memlimit.c" -o "$WORK/memlimit.o"
+  clang++ -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
+    -I"$HERE/ramhelper" "$HERE/ramhelper/ramprobe.mm" -o "$WORK/ramprobe.o"
+  clang++ "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 \
+    -dynamiclib -install_name "@rpath/libmemlimit.dylib" \
+    "$WORK/memlimit.o" "$WORK/ramprobe.o" -framework Foundation -o "$WORK/libmemlimit.dylib"
+else
+  clang "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
+    -dynamiclib -install_name "@rpath/libmemlimit.dylib" \
+    -DDEFAULT_LIMIT_MB="$LIMIT_MB" "$HERE/memlimit.c" -o "$WORK/libmemlimit.dylib"
+fi
 
 mkdir -p "$APP/Frameworks"
 cp "$WORK/libmemlimit.dylib" "$APP/Frameworks/libmemlimit.dylib"
+
+if [ "$RAM_PROBE" = "1" ]; then
+  APP_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")"
+  EXT="$APP/PlugIns/RamHelper.appex"
+  rm -rf "$EXT"
+  mkdir -p "$EXT"
+  clang++ "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.3 -O2 -fobjc-arc -fapplication-extension \
+    -I"$HERE/ramhelper" "$HERE/ramhelper/extension.mm" -framework Foundation -o "$EXT/RamHelper"
+  sed "s|@APP_BUNDLE_ID@|$APP_BUNDLE_ID|" "$HERE/ramhelper/Info.plist" > "$EXT/Info.plist"
+  plutil -lint "$EXT/Info.plist"
+  ldid -S"$HERE/ramhelper/helper-entitlements.plist" "$EXT/RamHelper"
+  echo "    embedded $EXT (bundle id $APP_BUNDLE_ID.RamHelper)"
+fi
 
 echo "==> Adding load command to $EXEC_NAME"
 if ! command -v insert_dylib >/dev/null; then
