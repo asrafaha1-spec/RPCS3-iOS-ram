@@ -19,6 +19,8 @@
 #include <sys/syslog.h>
 #include <pthread.h>
 #include <time.h>
+#include <mach/mach.h>
+#include <mach/vm_region.h>
 
 #if defined(__has_include)
 #if __has_include(<os/proc.h>)
@@ -81,6 +83,52 @@ static long available_mb(void) {
     return -1;
 }
 
+
+// Memory breakdown: walk this process' VM regions and sum dirty + compressed pages by kind.
+// Shows what actually fills the footprint (malloc heap, file-backed mappings such as the PS3 shm
+// file, other anonymous memory such as the JIT arena or GPU buffers) so we know whether lending
+// memory from a helper process could help at all.
+#define NB 6
+static const char *bucket_name[NB] = {"malloc", "file-backed", "anon-untagged", "graphics/IOSurface", "stack", "other-tagged"};
+
+static int bucket_of(const vm_region_submap_info_data_64_t *i) {
+    unsigned t = i->user_tag;
+    if (t >= 1 && t <= 11) return 0;          // VM_MEMORY_MALLOC*
+    if (t == 30 || t == 31) return 4;         // stack
+    if (t == 20 || t == 21 || t == 23 || t == 24 || t == 25 || t == 26 || t == 27) return 3; // GL/CG/IOSurface-ish
+    if (i->external_pager) return 1;          // file-backed
+    if (t == 0) return 2;
+    return 5;
+}
+
+static void log_breakdown(int elapsed) {
+    uint64_t sum[NB] = {0};
+    uint64_t resident[NB] = {0};
+    mach_vm_address_t addr = 0;
+    natural_t depth = 0;
+    const uint64_t page = vm_page_size;
+    for (int guard = 0; guard < 200000; guard++) {
+        vm_address_t a = (vm_address_t)addr;
+        vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &a, &size, &depth,
+                                                (vm_region_recurse_info_t)&info, &count);
+        if (kr != KERN_SUCCESS) break;
+        if (info.is_submap) { depth++; continue; }
+        int b = bucket_of(&info);
+        sum[b] += ((uint64_t)info.pages_dirty + info.pages_swapped_out) * page;
+        resident[b] += (uint64_t)info.pages_resident * page;
+        addr = (mach_vm_address_t)a + size;
+    }
+    char line[400];
+    int n = snprintf(line, sizeof line, "mem(t+%ds) dirty+swapped MB:", elapsed);
+    for (int b = 0; b < NB && n < (int)sizeof line - 60; b++)
+        n += snprintf(line + n, sizeof line - n, " %s=%llu(res %llu)", bucket_name[b],
+                      (unsigned long long)(sum[b] >> 20), (unsigned long long)(resident[b] >> 20));
+    log_line(line);
+}
+
 // Every 3 s, record how much memory this process may still allocate before iOS kills it.
 // The last line before a crash shows how close to the limit the app was.
 static void *monitor_thread(void *arg) {
@@ -90,6 +138,8 @@ static void *monitor_thread(void *arg) {
         sleep(3);
         elapsed += 3;
         log_msg("headroom=%dMB (t+%ds)", (int)available_mb(), elapsed);
+        if (elapsed % 6 == 0)
+            log_breakdown(elapsed);
     }
     return NULL;
 }
