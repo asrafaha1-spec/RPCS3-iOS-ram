@@ -117,7 +117,7 @@ static void log_breakdown(int elapsed) {
         if (kr != KERN_SUCCESS) break;
         if (info.is_submap) { depth++; continue; }
         int b = bucket_of(&info);
-        sum[b] += ((uint64_t)info.pages_dirty + info.pages_swapped_out) * page;
+        sum[b] += ((uint64_t)info.pages_dirtied + info.pages_swapped_out) * page;
         resident[b] += (uint64_t)info.pages_resident * page;
         addr = (mach_vm_address_t)a + size;
     }
