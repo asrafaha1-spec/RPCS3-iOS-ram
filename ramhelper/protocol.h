@@ -39,10 +39,11 @@
 #define RAMH_KEY_ERROR "error"
 #define RAMH_KEY_AVAILABLE "available"
 #define RAMH_KEY_FOOTPRINT "footprint"
+#define RAMH_KEY_ID "id" // region id: returned by create, passed to release
 
 // Operations
 #define RAMH_OP_HELLO "hello" // helper -> the host app, once connected
 #define RAMH_OP_CREATE "create" // a region of RAMH_KEY_SIZE bytes, returned as RAMH_KEY_SHMEM
-#define RAMH_OP_RELEASE "release" // drop every region (the host app has unmapped them)
+#define RAMH_OP_RELEASE "release" // drop the region RAMH_KEY_ID, or every region when no id is given
 #define RAMH_OP_AVAILABLE "available" // os_proc_available_memory() of the helper
 #define RAMH_OP_FOOTPRINT "footprint" // phys_footprint of the helper

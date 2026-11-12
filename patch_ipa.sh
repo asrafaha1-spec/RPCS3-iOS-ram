@@ -47,18 +47,40 @@ for a in $ARCHS; do
   case "$a" in arm64|arm64e) ARCH_FLAGS+=(-arch "$a");; esac
 done
 [ ${#ARCH_FLAGS[@]} -gt 0 ] || ARCH_FLAGS=(-arch arm64)
-# RAM_PROBE=1 builds the experiment in ramhelper/: a RamHelper.appex extension plus a probe in the
-# dylib that measures whether memory lent by the helper escapes this app's memory limit.
+# RAM_PROBE=1  builds the measurement probe (ramhelper/ramprobe.mm).
+# RAM_HELPER=1 builds the shm redirect (ramhelper/shmredirect.cpp): the emulator core's big guest-memory
+#              objects are backed by memory lent from a RamHelper.appex process. It stays OFF until the file
+#              Documents/ramhelper.enable exists in the app's Files folder.
+# Either one embeds RamHelper.appex (a separate process with its own memory limit).
 RAM_PROBE="${RAM_PROBE:-0}"
-if [ "$RAM_PROBE" = "1" ]; then
-  echo "==> RAM_PROBE=1: building helper extension and probe"
+RAM_HELPER="${RAM_HELPER:-0}"
+BUILD_EXT=0
+{ [ "$RAM_PROBE" = "1" ] || [ "$RAM_HELPER" = "1" ]; } && BUILD_EXT=1
+if [ "$BUILD_EXT" = "1" ]; then
+  echo "==> RAM_PROBE=$RAM_PROBE RAM_HELPER=$RAM_HELPER: building helper pieces"
+  DEFS=()
+  [ "$RAM_PROBE" = "1" ] && DEFS+=(-DRAM_PROBE=1)
+  [ "$RAM_HELPER" = "1" ] && DEFS+=(-DRAM_HELPER=1)
+  OBJS=("$WORK/memlimit.o")
   clang -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
-    -DDEFAULT_LIMIT_MB="$LIMIT_MB" -DRAM_PROBE=1 "$HERE/memlimit.c" -o "$WORK/memlimit.o"
-  clang++ -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
-    -I"$HERE/ramhelper" "$HERE/ramhelper/ramprobe.mm" -o "$WORK/ramprobe.o"
+    -DDEFAULT_LIMIT_MB="$LIMIT_MB" "${DEFS[@]}" "$HERE/memlimit.c" -o "$WORK/memlimit.o"
+  if [ "$RAM_PROBE" = "1" ]; then
+    clang++ -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
+      -I"$HERE/ramhelper" "$HERE/ramhelper/ramprobe.mm" -o "$WORK/ramprobe.o"
+    OBJS+=("$WORK/ramprobe.o")
+  fi
+  if [ "$RAM_HELPER" = "1" ]; then
+    clang++ -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fobjc-arc \
+      -I"$HERE/ramhelper" "$HERE/ramhelper/ramhost.mm" -o "$WORK/ramhost.o"
+    clang++ -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -std=c++17 \
+      -I"$HERE/ramhelper" "$HERE/ramhelper/shmredirect.cpp" -o "$WORK/shmredirect.o"
+    clang -c "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
+      "$HERE/ramhelper/fishhook.c" -o "$WORK/fishhook.o"
+    OBJS+=("$WORK/ramhost.o" "$WORK/shmredirect.o" "$WORK/fishhook.o")
+  fi
   clang++ "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 \
     -dynamiclib -install_name "@rpath/libmemlimit.dylib" \
-    "$WORK/memlimit.o" "$WORK/ramprobe.o" -framework Foundation -o "$WORK/libmemlimit.dylib"
+    "${OBJS[@]}" -framework Foundation -o "$WORK/libmemlimit.dylib"
 else
   clang "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 \
     -dynamiclib -install_name "@rpath/libmemlimit.dylib" \
@@ -68,7 +90,7 @@ fi
 mkdir -p "$APP/Frameworks"
 cp "$WORK/libmemlimit.dylib" "$APP/Frameworks/libmemlimit.dylib"
 
-if [ "$RAM_PROBE" = "1" ]; then
+if [ "$BUILD_EXT" = "1" ]; then
   APP_BUNDLE_ID="$(plutil -extract CFBundleIdentifier raw "$APP/Info.plist")"
   EXT="$APP/PlugIns/RamHelper.appex"
   rm -rf "$EXT"

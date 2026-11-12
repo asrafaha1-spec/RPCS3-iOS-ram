@@ -140,6 +140,12 @@ static void *monitor_thread(void *arg) {
         log_msg("headroom=%dMB (t+%ds)", (int)available_mb(), elapsed);
         if (elapsed % 6 == 0)
             log_breakdown(elapsed);
+#ifdef RAM_HELPER
+        if (elapsed % 30 == 0) {
+            extern void ramhelper_log_stats(void);
+            ramhelper_log_stats();
+        }
+#endif
     }
     return NULL;
 }
@@ -181,6 +187,13 @@ __attribute__((constructor)) static void memlimit_init(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, monitor_thread, NULL) == 0)
         pthread_detach(t);
+
+#ifdef RAM_HELPER
+    // Experiment (see ramhelper/shmredirect.cpp): hooks the core's shm allocation to use RAM helper memory.
+    // Does nothing unless Documents/ramhelper.enable exists.
+    extern void ramhelper_install(void);
+    ramhelper_install();
+#endif
 
 #ifdef RAM_PROBE
     // Experiment (see ramhelper/ramprobe.mm): only compiled in when the IPA is built with RAM_PROBE=1.

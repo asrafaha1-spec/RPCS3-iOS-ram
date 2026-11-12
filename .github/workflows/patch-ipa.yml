@@ -19,6 +19,10 @@ on:
         description: "Build the RAM helper experiment (adds RamHelper.appex; output is named -ramprobe.ipa)"
         type: boolean
         default: false
+      ram_helper:
+        description: "Build the shm redirect: guest memory backed by RamHelper.appex (OFF until Documents/ramhelper.enable exists; output is named -ramhelper.ipa)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -45,11 +49,12 @@ jobs:
         run: |
           chmod +x patch_ipa.sh
           shopt -s nullglob
-          SUFFIX="memlimit"; PROBE=0
+          SUFFIX="memlimit"; PROBE=0; HELPER=0
           if [ "${{ inputs.ram_probe }}" = "true" ]; then SUFFIX="ramprobe"; PROBE=1; fi
+          if [ "${{ inputs.ram_helper }}" = "true" ]; then SUFFIX="ramhelper"; HELPER=1; fi
           for f in original/*.ipa; do
-            case "$f" in *-memlimit.ipa|*-ramprobe.ipa) continue;; esac
-            RAM_PROBE=$PROBE ./patch_ipa.sh "$f" "patched/$(basename "${f%.ipa}")-$SUFFIX.ipa" "${{ inputs.limit_mb }}"
+            case "$f" in *-memlimit.ipa|*-ramprobe.ipa|*-ramhelper.ipa) continue;; esac
+            RAM_PROBE=$PROBE RAM_HELPER=$HELPER ./patch_ipa.sh "$f" "patched/$(basename "${f%.ipa}")-$SUFFIX.ipa" "${{ inputs.limit_mb }}"
           done
           ls -la patched
 

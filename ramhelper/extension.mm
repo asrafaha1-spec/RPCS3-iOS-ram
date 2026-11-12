@@ -52,21 +52,30 @@ extern "C" int NSExtensionMain(int argc, char *argv[]);
 namespace {
 
 struct Region {
+    uint64_t id;
     mach_vm_address_t base;
     mach_vm_size_t size;
 };
 
 std::vector<Region> g_regions;
+uint64_t g_next_id = 1;
 
-void release_regions() {
-    for (const Region &region : g_regions)
-        mach_vm_deallocate(mach_task_self(), region.base, region.size);
-    g_regions.clear();
+// id 0 drops every region. The memory itself lives on while the host app keeps it mapped
+// (the mapping holds the same VM object); this only drops the helper's own mapping.
+void release_regions(uint64_t id) {
+    for (size_t i = 0; i < g_regions.size();) {
+        if (id == 0 || g_regions[i].id == id) {
+            mach_vm_deallocate(mach_task_self(), g_regions[i].base, g_regions[i].size);
+            g_regions.erase(g_regions.begin() + i);
+        } else {
+            i++;
+        }
+    }
 }
 
 // Purgeable memory belongs to (and is charged to) the process that allocated it, whoever maps it
-xpc_object_t create_region(uint64_t size, NSString **error) {
-    if (size == 0 || size > 4 * RAMH_HELPER_CHUNK) {
+xpc_object_t create_region(uint64_t size, uint64_t *id, NSString **error) {
+    if (size == 0 || size > 8 * RAMH_HELPER_CHUNK) {
         *error = @"Bad region size";
         return nil;
     }
@@ -82,7 +91,8 @@ xpc_object_t create_region(uint64_t size, NSString **error) {
         *error = @"xpc_shmem_create failed";
         return nil;
     }
-    g_regions.push_back({ address, size });
+    *id = g_next_id++;
+    g_regions.push_back({ *id, address, size });
     return shmem;
 }
 
@@ -106,13 +116,15 @@ void handle_message(xpc_connection_t channel, xpc_object_t message) {
 
     if (strcmp(op, RAMH_OP_CREATE) == 0) {
         NSString *error = nil;
-        xpc_object_t shmem = create_region(xpc_dictionary_get_uint64(message, RAMH_KEY_SIZE), &error);
-        if (shmem)
+        uint64_t id = 0;
+        xpc_object_t shmem = create_region(xpc_dictionary_get_uint64(message, RAMH_KEY_SIZE), &id, &error);
+        if (shmem) {
             xpc_dictionary_set_value(reply, RAMH_KEY_SHMEM, shmem);
-        else
+            xpc_dictionary_set_uint64(reply, RAMH_KEY_ID, id);
+        } else
             xpc_dictionary_set_string(reply, RAMH_KEY_ERROR, error.UTF8String);
     } else if (strcmp(op, RAMH_OP_RELEASE) == 0) {
-        release_regions();
+        release_regions(xpc_dictionary_get_uint64(message, RAMH_KEY_ID));
     } else if (strcmp(op, RAMH_OP_AVAILABLE) == 0) {
         xpc_dictionary_set_uint64(reply, RAMH_KEY_AVAILABLE, static_cast<uint64_t>(os_proc_available_memory()));
     } else if (strcmp(op, RAMH_OP_FOOTPRINT) == 0) {
