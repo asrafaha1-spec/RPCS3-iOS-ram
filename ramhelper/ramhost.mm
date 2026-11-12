@@ -180,6 +180,18 @@ extern "C" bool ramhost_start(void) {
     return ok;
 }
 
+extern "C" void ramhost_kill(void) {
+    pthread_mutex_lock(&g_start_lock);
+    g_attempts = kMaxStartAttempts; // no restart
+    g_connected_flag = false;
+    id<RamHostExtensionAPI> extension = g_extension;
+    pthread_mutex_unlock(&g_start_lock);
+    if (extension) {
+        [extension _kill:SIGKILL];
+        HLOG("helper killed on purpose (kill test)");
+    }
+}
+
 extern "C" uint64_t ramhost_helper_available(void) {
     xpc_object_t reply = send_op(RAMH_OP_AVAILABLE, 0, 0, 3.0);
     return reply ? xpc_dictionary_get_uint64(reply, RAMH_KEY_AVAILABLE) : 0;

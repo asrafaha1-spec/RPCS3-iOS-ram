@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <os/proc.h>
 #include <unistd.h>
 
 #include "fishhook.h"
@@ -58,6 +59,8 @@ bool g_enabled = false; // cleared for good if the helper cannot be used
 uint64_t g_threshold = 8ull << 20;
 uint64_t g_cap = 1900ull << 20;
 uint64_t g_lent = 0; // bytes currently lent (including reservations in flight)
+unsigned g_kill_after_s = 0;   // kill test: kill the helper this long after the first redirect (0 = never)
+bool g_kill_started = false;
 unsigned g_redirected_shm = 0, g_fallback_shm = 0, g_redirected_maps = 0, g_failed_maps = 0, g_logged_maps = 0;
 
 typedef int (*mkstemp_fn)(char *);
@@ -74,6 +77,24 @@ mprotect_fn real_mprotect;
 unsigned long long mib(uint64_t bytes) { return (unsigned long long)(bytes >> 20); }
 
 bool in_range(int fd) { return fd >= 0 && fd < kMaxFd; }
+
+void log_foot_now(const char *label);
+
+// Kill test (Documents/ramhelper.kill): does ending the helper after it lent memory stop the app being
+// charged for it? Logs both footprints before and after, over the next seconds.
+void *kill_test_thread(void *) {
+    sleep(g_kill_after_s);
+    log_foot_now("before kill");
+    ramhost_kill();
+    pthread_mutex_lock(&g_lock);
+    g_enabled = false; // later shm objects stay in files; the helper is gone
+    pthread_mutex_unlock(&g_lock);
+    for (int i = 0; i < 4; i++) {
+        sleep(i == 0 ? 2 : 5);
+        log_foot_now("after kill");
+    }
+    return nullptr;
+}
 
 // Decide, once, whether this shm lives in the helper. Called right after ftruncate set its size.
 void maybe_use_helper(int fd, uint64_t size) {
@@ -105,7 +126,16 @@ void maybe_use_helper(int fd, uint64_t size) {
         g_fd[fd].id = id;
         g_redirected_shm++;
         const uint64_t lent = g_lent;
+        const bool start_kill = g_kill_after_s && !g_kill_started;
+        if (start_kill)
+            g_kill_started = true;
         pthread_mutex_unlock(&g_lock);
+        if (start_kill) {
+            pthread_t kt;
+            if (pthread_create(&kt, nullptr, kill_test_thread, nullptr) == 0)
+                pthread_detach(kt);
+            RLOG("kill test armed: the helper will be killed %u s from now", g_kill_after_s);
+        }
         RLOG("shm fd=%d %llu MiB -> helper region %llu (lent now %llu MiB)", fd, mib(size), (unsigned long long)id, mib(lent));
         return;
     }
@@ -218,6 +248,12 @@ bool read_config() {
     FILE *f = fopen(path, "r");
     if (!f)
         return false;
+    {
+        char kill_path[1024];
+        snprintf(kill_path, sizeof kill_path, "%s/Documents/ramhelper.kill", home);
+        if (access(kill_path, F_OK) == 0)
+            g_kill_after_s = 30;
+    }
     unsigned long long threshold = 0, cap = 0;
     const int n = fscanf(f, "%llu %llu", &threshold, &cap);
     fclose(f);
@@ -263,6 +299,20 @@ void *watch_for_core(void *) {
 } // namespace
 
 // The decisive numbers: is the lent memory charged to this app or to the helper?
+namespace {
+void log_foot_now(const char *label) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    const uint64_t app = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS ? info.phys_footprint : 0;
+    pthread_mutex_lock(&g_lock);
+    const uint64_t lent = g_lent;
+    pthread_mutex_unlock(&g_lock);
+    const uint64_t helper = ramhost_helper_footprint();
+    RLOG("foot[%s]: app=%llu MiB (compressed %llu), available=%llu MiB, helper=%llu MiB, lent(mapped)=%llu MiB", label,
+         mib(app), mib(info.compressed), mib(os_proc_available_memory()), mib(helper), mib(lent));
+}
+} // namespace
+
 extern "C" void ramhelper_log_footprint(void) {
     if (!g_enabled)
         return;
