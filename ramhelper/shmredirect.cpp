@@ -230,6 +230,38 @@ bool read_config() {
 
 } // namespace
 
+namespace {
+
+// The app loads the core with dlopen() some time after launch, so it is not in the image list yet when
+// our constructor runs. Poll for it, then hook its imports.
+void *watch_for_core(void *) {
+    for (int waited_ms = 0; waited_ms < 10 * 60 * 1000; waited_ms += 50) {
+        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (!name || !strstr(name, "libRPCS3Core.dylib"))
+                continue;
+            struct rebinding hooks[] = {
+                { "mkstemp", (void *)hook_mkstemp, nullptr },
+                { "ftruncate", (void *)hook_ftruncate, nullptr },
+                { "mmap", (void *)hook_mmap, nullptr },
+                { "close", (void *)hook_close, nullptr },
+            };
+            const int rc = rebind_symbols_image((void *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), hooks,
+                                                sizeof hooks / sizeof hooks[0]);
+            RLOG("hooked the core's mkstemp/ftruncate/mmap/close after %d ms (rc=%d)", waited_ms, rc);
+            return nullptr;
+        }
+        usleep(50 * 1000);
+    }
+    RLOG("FAIL: libRPCS3Core.dylib never appeared, nothing hooked");
+    pthread_mutex_lock(&g_lock);
+    g_enabled = false;
+    pthread_mutex_unlock(&g_lock);
+    return nullptr;
+}
+
+} // namespace
+
 extern "C" void ramhelper_log_stats(void) {
     if (!g_enabled)
         return;
@@ -254,29 +286,14 @@ extern "C" void ramhelper_install(void) {
         return;
     }
 
-    const struct mach_header *header = nullptr;
-    intptr_t slide = 0;
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "libRPCS3Core.dylib")) {
-            header = _dyld_get_image_header(i);
-            slide = _dyld_get_image_vmaddr_slide(i);
-            break;
-        }
-    }
-    if (!header) {
-        RLOG("FAIL: libRPCS3Core.dylib is not loaded, nothing hooked");
-        return;
-    }
-
     g_enabled = true;
-    struct rebinding hooks[] = {
-        { "mkstemp", (void *)hook_mkstemp, nullptr },
-        { "ftruncate", (void *)hook_ftruncate, nullptr },
-        { "mmap", (void *)hook_mmap, nullptr },
-        { "close", (void *)hook_close, nullptr },
-    };
-    const int rc = rebind_symbols_image((void *)header, slide, hooks, sizeof hooks / sizeof hooks[0]);
-    RLOG("shm redirect ON: threshold %llu MiB, cap %llu MiB; hooked the core's mkstemp/ftruncate/mmap/close (rc=%d)",
-         mib(g_threshold), mib(g_cap), rc);
+    RLOG("shm redirect ON: threshold %llu MiB, cap %llu MiB; waiting for the app to dlopen libRPCS3Core.dylib",
+         mib(g_threshold), mib(g_cap));
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, watch_for_core, nullptr) == 0) {
+        pthread_detach(thread);
+    } else {
+        g_enabled = false;
+        RLOG("FAIL: could not start the watcher thread, nothing hooked");
+    }
 }
