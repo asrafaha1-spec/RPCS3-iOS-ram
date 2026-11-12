@@ -59,8 +59,9 @@ bool g_enabled = false; // cleared for good if the helper cannot be used
 uint64_t g_threshold = 8ull << 20;
 uint64_t g_cap = 1900ull << 20;
 uint64_t g_lent = 0; // bytes currently lent (including reservations in flight)
-unsigned g_kill_after_s = 0;   // kill test: kill the helper this long after the first redirect (0 = never)
-bool g_kill_started = false;
+unsigned g_kill_after_s = 0;   // MeloCafe style: kill the helper this long after the last mapping (0 = keep it alive)
+unsigned g_kill_gen = 0;       // bumped by every redirect; a pending kill is dropped when it is stale
+unsigned g_inflight = 0;       // helper requests being made right now
 unsigned g_redirected_shm = 0, g_fallback_shm = 0, g_redirected_maps = 0, g_failed_maps = 0, g_logged_maps = 0;
 
 typedef int (*mkstemp_fn)(char *);
@@ -80,20 +81,36 @@ bool in_range(int fd) { return fd >= 0 && fd < kMaxFd; }
 
 void log_foot_now(const char *label);
 
-// Kill test (Documents/ramhelper.kill): does ending the helper after it lent memory stop the app being
-// charged for it? Logs both footprints before and after, over the next seconds.
-void *kill_test_thread(void *) {
+// Kill mode (Documents/ramhelper.kill), as in MeloCafe's killDonorsAfterMapping: once the lent memory
+// is mapped the helper is killed, so the memory is owned by no process and is charged to none. The core
+// allocates in stages, so the kill waits until nothing new has been lent for a few seconds; the next big
+// object starts a fresh helper. Logs both footprints around the kill.
+void *kill_thread(void *arg) {
+    const unsigned generation = (unsigned)(uintptr_t)arg;
     sleep(g_kill_after_s);
+    pthread_mutex_lock(&g_lock);
+    const bool stale = generation != g_kill_gen || g_inflight > 0;
+    pthread_mutex_unlock(&g_lock);
+    if (stale)
+        return nullptr;
     log_foot_now("before kill");
     ramhost_kill();
-    pthread_mutex_lock(&g_lock);
-    g_enabled = false; // later shm objects stay in files; the helper is gone
-    pthread_mutex_unlock(&g_lock);
-    for (int i = 0; i < 4; i++) {
-        sleep(i == 0 ? 2 : 5);
-        log_foot_now("after kill");
-    }
+    sleep(2);
+    log_foot_now("2 s after kill");
+    sleep(8);
+    log_foot_now("10 s after kill");
     return nullptr;
+}
+
+void schedule_kill() {
+    if (!g_kill_after_s)
+        return;
+    pthread_mutex_lock(&g_lock);
+    const unsigned generation = ++g_kill_gen;
+    pthread_mutex_unlock(&g_lock);
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, kill_thread, (void *)(uintptr_t)generation) == 0)
+        pthread_detach(thread);
 }
 
 // Decide, once, whether this shm lives in the helper. Called right after ftruncate set its size.
@@ -101,8 +118,11 @@ void maybe_use_helper(int fd, uint64_t size) {
     pthread_mutex_lock(&g_lock);
     const bool enabled = g_enabled;
     const bool reserve_ok = g_lent + size <= g_cap;
-    if (enabled && reserve_ok)
+    if (enabled && reserve_ok) {
         g_lent += size; // reserve while we talk to the helper
+        g_inflight++;
+        g_kill_gen++; // a pending kill must wait for this one
+    }
     pthread_mutex_unlock(&g_lock);
     if (!enabled)
         return;
@@ -125,23 +145,18 @@ void maybe_use_helper(int fd, uint64_t size) {
         g_fd[fd].base = base;
         g_fd[fd].id = id;
         g_redirected_shm++;
+        g_inflight--;
         const uint64_t lent = g_lent;
-        const bool start_kill = g_kill_after_s && !g_kill_started;
-        if (start_kill)
-            g_kill_started = true;
         pthread_mutex_unlock(&g_lock);
-        if (start_kill) {
-            pthread_t kt;
-            if (pthread_create(&kt, nullptr, kill_test_thread, nullptr) == 0)
-                pthread_detach(kt);
-            RLOG("kill test armed: the helper will be killed %u s from now", g_kill_after_s);
-        }
+        schedule_kill();
         RLOG("shm fd=%d %llu MiB -> helper region %llu (lent now %llu MiB)", fd, mib(size), (unsigned long long)id, mib(lent));
         return;
     }
     g_lent -= size;
+    g_inflight--;
     g_fallback_shm++;
     pthread_mutex_unlock(&g_lock);
+    schedule_kill();
     if (ok)
         ramhost_release(id, base, size);
     else
@@ -252,7 +267,7 @@ bool read_config() {
         char kill_path[1024];
         snprintf(kill_path, sizeof kill_path, "%s/Documents/ramhelper.kill", home);
         if (access(kill_path, F_OK) == 0)
-            g_kill_after_s = 30;
+            g_kill_after_s = 2;
     }
     unsigned long long threshold = 0, cap = 0;
     const int n = fscanf(f, "%llu %llu", &threshold, &cap);

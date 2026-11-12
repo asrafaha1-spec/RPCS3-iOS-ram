@@ -52,6 +52,14 @@ xpc_connection_t g_listener = nil;
 xpc_connection_t g_helper = nil;
 id<RamHostExtensionAPI> g_extension = nil;
 
+// Every helper process gets a generation number. Region ids start again at 1 in each new helper, so
+// the ids handed out here carry the generation in their top half: a late release for a region of a
+// dead helper can never free a region of the new one.
+uint64_t g_generation = 1;
+pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;
+// The xpc shared-memory objects of the regions, kept alive like MeloCafe does (region.shmems).
+NSMutableDictionary<NSNumber *, id> *g_shmems = nil;
+
 NSString *helper_identifier() {
     NSArray<NSURL *> *contents = [NSFileManager.defaultManager contentsOfDirectoryAtURL:NSBundle.mainBundle.builtInPlugInsURL
                                                              includingPropertiesForKeys:nil
@@ -97,13 +105,14 @@ bool start_once() {
     }
 
     dispatch_semaphore_t connected = dispatch_semaphore_create(0);
+    const uint64_t my_generation = g_generation;
     g_listener = xpc_connection_create(NULL, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
     xpc_connection_set_event_handler(g_listener, ^(xpc_object_t event) {
         if (xpc_get_type(event) != XPC_TYPE_CONNECTION)
             return;
         xpc_connection_t connection = (xpc_connection_t)event;
         xpc_connection_set_event_handler(connection, ^(xpc_object_t message) {
-            if (xpc_get_type(message) == XPC_TYPE_ERROR) {
+            if (xpc_get_type(message) == XPC_TYPE_ERROR && my_generation == g_generation) {
                 g_connected_flag = false;
                 HLOG("helper connection closed (memory already mapped stays valid)");
             }
@@ -131,7 +140,8 @@ bool start_once() {
     }
     extension.preferredLanguages = @[];
     [extension setRequestCancellationBlock:^(NSUUID *, NSError *cancel_error) {
-        g_connected_flag = false;
+        if (my_generation == g_generation)
+            g_connected_flag = false;
         HLOG("helper request cancelled: %s", cancel_error.localizedDescription.UTF8String ?: "");
     }];
 
@@ -182,13 +192,20 @@ extern "C" bool ramhost_start(void) {
 
 extern "C" void ramhost_kill(void) {
     pthread_mutex_lock(&g_start_lock);
-    g_attempts = kMaxStartAttempts; // no restart
-    g_connected_flag = false;
     id<RamHostExtensionAPI> extension = g_extension;
+    xpc_connection_t listener = g_listener;
+    g_connected_flag = false;
+    g_generation++; // regions of the old helper are never released through the new one
+    g_extension = nil;
+    g_helper = nil;
+    g_listener = nil;
+    g_attempts = 0; // a later request may start a fresh helper
     pthread_mutex_unlock(&g_start_lock);
+    if (listener)
+        xpc_connection_cancel(listener);
     if (extension) {
         [extension _kill:SIGKILL];
-        HLOG("helper killed on purpose (kill test)");
+        HLOG("helper killed after mapping (memory stays mapped here)");
     }
 }
 
@@ -228,17 +245,27 @@ extern "C" bool ramhost_create(uint64_t size, void **base, uint64_t *id) {
         return false;
     }
     *base = region;
-    *id = xpc_dictionary_get_uint64(reply, RAMH_KEY_ID);
+    const uint64_t local_id = xpc_dictionary_get_uint64(reply, RAMH_KEY_ID);
+    pthread_mutex_lock(&g_state_lock);
+    *id = (g_generation << 32) | (local_id & 0xffffffffull);
+    if (!g_shmems)
+        g_shmems = [NSMutableDictionary dictionary];
+    g_shmems[@(*id)] = shmem;
+    pthread_mutex_unlock(&g_state_lock);
     return true;
 }
 
 extern "C" void ramhost_release(uint64_t id, void *base, uint64_t size) {
     mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)base, size);
+    pthread_mutex_lock(&g_state_lock);
+    [g_shmems removeObjectForKey:@(id)];
+    const bool same_helper = (id >> 32) == g_generation;
+    pthread_mutex_unlock(&g_state_lock);
     xpc_connection_t helper = g_helper;
-    if (helper && g_connected_flag && id) {
+    if (helper && g_connected_flag && same_helper && (id & 0xffffffffull)) {
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, RAMH_KEY_OP, RAMH_OP_RELEASE);
-        xpc_dictionary_set_uint64(request, RAMH_KEY_ID, id);
+        xpc_dictionary_set_uint64(request, RAMH_KEY_ID, id & 0xffffffffull);
         xpc_connection_send_message(helper, request);
     }
 }
