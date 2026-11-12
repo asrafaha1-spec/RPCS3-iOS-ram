@@ -262,6 +262,22 @@ void *watch_for_core(void *) {
 
 } // namespace
 
+// The decisive numbers: is the lent memory charged to this app or to the helper?
+extern "C" void ramhelper_log_footprint(void) {
+    if (!g_enabled)
+        return;
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    const uint64_t app = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS ? info.phys_footprint : 0;
+    pthread_mutex_lock(&g_lock);
+    const uint64_t lent = g_lent;
+    pthread_mutex_unlock(&g_lock);
+    if (lent == 0)
+        return;
+    const uint64_t helper = ramhost_helper_footprint();
+    RLOG("foot: app=%llu MiB (compressed %llu), helper=%llu MiB, lent(mapped)=%llu MiB", mib(app), mib(info.compressed), mib(helper), mib(lent));
+}
+
 extern "C" void ramhelper_log_stats(void) {
     if (!g_enabled)
         return;

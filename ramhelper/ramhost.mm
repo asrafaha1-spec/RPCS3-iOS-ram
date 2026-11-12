@@ -185,6 +185,11 @@ extern "C" uint64_t ramhost_helper_available(void) {
     return reply ? xpc_dictionary_get_uint64(reply, RAMH_KEY_AVAILABLE) : 0;
 }
 
+extern "C" uint64_t ramhost_helper_footprint(void) {
+    xpc_object_t reply = send_op(RAMH_OP_FOOTPRINT, 0, 0, 3.0);
+    return reply ? xpc_dictionary_get_uint64(reply, RAMH_KEY_FOOTPRINT) : 0;
+}
+
 extern "C" bool ramhost_create(uint64_t size, void **base, uint64_t *id) {
     if (!g_connected_flag)
         return false;

@@ -141,6 +141,10 @@ static void *monitor_thread(void *arg) {
         if (elapsed % 6 == 0)
             log_breakdown(elapsed);
 #ifdef RAM_HELPER
+        if (elapsed % 6 == 0) {
+            extern void ramhelper_log_footprint(void);
+            ramhelper_log_footprint();
+        }
         if (elapsed % 30 == 0) {
             extern void ramhelper_log_stats(void);
             ramhelper_log_stats();
