@@ -129,15 +129,61 @@ static void log_breakdown(int elapsed) {
     log_line(line);
 }
 
+
+// Quiet version of the raise: the two kernel calls only. 0 when either was accepted.
+static int g_limit_mb = 0;
+static int apply_limit_quiet(int limit_mb) {
+    pid_t pid = getpid();
+    int r1 = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT, pid, (uint32_t)limit_mb, NULL, 0);
+    int r2 = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK, pid, (uint32_t)limit_mb, NULL, 0);
+    return (r1 == 0 || r2 == 0) ? 0 : -1;
+}
+
+static long footprint_mb(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return -1;
+    return (long)(info.phys_footprint / (1024 * 1024));
+}
+
+// The limit this process really has right now: what it may still allocate plus what it already uses.
+static long effective_limit_mb(void) {
+    long avail = available_mb(), foot = footprint_mb();
+    return (avail < 0 || foot < 0) ? -1 : avail + foot;
+}
+
+// iOS puts the stock limit back a few seconds after launch (the launch-time raise is gone by then: the
+// logs show headroom + footprint = 2347 MB in every sample). Check every second and apply it again.
+static void reapply_if_dropped(void) {
+    static int logged = 0;
+    long eff = effective_limit_mb();
+    if (g_limit_mb <= 0 || eff < 0 || eff + 128 >= g_limit_mb)
+        return;
+    int rc = apply_limit_quiet(g_limit_mb);
+    long after = effective_limit_mb();
+    if (logged < 25) {
+        logged++;
+        char line[160];
+        snprintf(line, sizeof line, "limit had dropped to %ldMB; re-applied (rc=%d), now %ldMB", eff, rc, after);
+        log_line(line);
+    }
+}
+
 // Every 3 s, record how much memory this process may still allocate before iOS kills it.
 // The last line before a crash shows how close to the limit the app was.
 static void *monitor_thread(void *arg) {
     (void)arg;
     int elapsed = 0;
     for (;;) {
-        sleep(3);
+        for (int i = 0; i < 3; i++) {
+            sleep(1);
+            reapply_if_dropped();
+        }
         elapsed += 3;
-        log_msg("headroom=%dMB (t+%ds)", (int)available_mb(), elapsed);
+        char hline[96];
+        snprintf(hline, sizeof hline, "headroom=%ldMB limit~%ldMB (t+%ds)", available_mb(), effective_limit_mb(), elapsed);
+        log_line(hline);
         if (elapsed % 6 == 0)
             log_breakdown(elapsed);
 #ifdef RAM_HELPER
@@ -185,6 +231,7 @@ __attribute__((constructor)) static void memlimit_init(void) {
         if (v > 0)
             limit = v;
     }
+    g_limit_mb = limit;
     int rc = raise_memory_limit_mb(limit);
     log_msg("requested %dMB, result=%d", limit, rc);
 
