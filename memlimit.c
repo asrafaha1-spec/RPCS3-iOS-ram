@@ -154,7 +154,8 @@ static long effective_limit_mb(void) {
 }
 
 // iOS puts the stock limit back a few seconds after launch (the launch-time raise is gone by then: the
-// logs show headroom + footprint = 2347 MB in every sample). Check every second and apply it again.
+// logs show headroom + footprint = 2347 MB in every sample). Check every 250 ms and apply it again.
+static int g_resets = 0; // how many times iOS put the stock limit back
 static void reapply_if_dropped(void) {
     static int logged = 0;
     long eff = effective_limit_mb();
@@ -162,7 +163,8 @@ static void reapply_if_dropped(void) {
         return;
     int rc = apply_limit_quiet(g_limit_mb);
     long after = effective_limit_mb();
-    if (logged < 25) {
+    g_resets++;
+    if (logged < 60) {
         logged++;
         char line[160];
         snprintf(line, sizeof line, "limit had dropped to %ldMB; re-applied (rc=%d), now %ldMB", eff, rc, after);
@@ -176,13 +178,13 @@ static void *monitor_thread(void *arg) {
     (void)arg;
     int elapsed = 0;
     for (;;) {
-        for (int i = 0; i < 3; i++) {
-            sleep(1);
+        for (int i = 0; i < 12; i++) {
+            usleep(250 * 1000);
             reapply_if_dropped();
         }
         elapsed += 3;
         char hline[96];
-        snprintf(hline, sizeof hline, "headroom=%ldMB limit~%ldMB (t+%ds)", available_mb(), effective_limit_mb(), elapsed);
+        snprintf(hline, sizeof hline, "headroom=%ldMB limit~%ldMB resets=%d (t+%ds)", available_mb(), effective_limit_mb(), g_resets, elapsed);
         log_line(hline);
         if (elapsed % 6 == 0)
             log_breakdown(elapsed);
