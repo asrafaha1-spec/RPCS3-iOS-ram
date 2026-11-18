@@ -13,3 +13,12 @@ memory; that needs support inside the core.
 
 `extension.mm` and `protocol.h` are derived from Vita3KiOS (GPL-2.0-or-later), which credits the
 "RAM donor" technique to MeloNX (MIT). Keep the licence headers.
+
+
+## Soft memory budget (ram-helper build)
+
+The core trims its own texture/surface caches when `os_proc_available_memory()` reports little headroom
+(levels at 1.5 GiB, 1 GiB and 512 MiB). With the kernel limit raised that never happens, so the build
+reports `min(real, budget - footprint - lent memory in use)` to the core only. Budget: 3072 MiB by default;
+put a number of MiB in `Documents/ramhelper.budget` to change it, `0` to turn it off. Log lines:
+`pressure level the core sees: a -> b` and a `budget:` line every 30 s.

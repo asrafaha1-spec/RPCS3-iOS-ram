@@ -28,6 +28,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <os/proc.h>
+#include <atomic>
+#include <time.h>
 #include <unistd.h>
 
 #include "fishhook.h"
@@ -254,6 +256,121 @@ int hook_close(int fd) {
     return real_close(fd);
 }
 
+// ---- Soft memory budget for the core ----------------------------------------------------------------
+// The core already trims its texture/surface caches when memory runs short: its severity function reads
+// rpcs3::ios::available_process_memory_headroom(), which is a thin wrapper around the imported
+// os_proc_available_memory(), and maps it to levels (<1.5 GiB: 1, <1 GiB: 2, <512 MiB: 3). With the kernel
+// limit raised to 3.5 GB that headroom stays large, so the trimming never starts. We rebind
+// os_proc_available_memory in the core only and report min(real, budget - footprint - lent memory in use),
+// so the core's own LRU trimming starts at the budget we choose while the kernel limit stays high.
+// Documents/ramhelper.budget holds the budget in MiB (default 3072, 0 = off).
+
+typedef size_t (*oapm_fn)(void);
+oapm_fn real_oapm = nullptr;
+uint64_t g_budget = 3072ull << 20;
+bool g_budget_on = true;
+std::atomic<int> g_last_level{ -1 };
+std::atomic<unsigned> g_level_logs{ 0 };
+std::atomic<uint64_t> g_oapm_calls{ 0 }, g_last_soft{ 0 }, g_last_real{ 0 }, g_last_lent{ 0 };
+
+// Pages of helper-backed shm objects that are really in use. They are charged to the helper (or to
+// nobody after a kill), not to this app, but they still take physical RAM. Measured on the base mapping we
+// keep of every region; cached for one second.
+uint64_t lent_touched_bytes() {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t cached = 0;
+    static time_t cached_at = 0;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    pthread_mutex_lock(&m);
+    if (cached_at != 0 && now.tv_sec - cached_at < 1) {
+        const uint64_t value = cached;
+        pthread_mutex_unlock(&m);
+        return value;
+    }
+    pthread_mutex_unlock(&m);
+
+    struct Span {
+        uintptr_t base;
+        uint64_t size;
+    };
+    Span spans[256];
+    int n = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int fd = 0; fd < kMaxFd && n < 256; fd++)
+        if (g_fd[fd].used && g_fd[fd].helper)
+            spans[n++] = { (uintptr_t)g_fd[fd].base, g_fd[fd].size };
+    pthread_mutex_unlock(&g_lock);
+
+    uint64_t total = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t resident = 0;
+        vm_address_t a = spans[i].base;
+        const vm_address_t end = spans[i].base + spans[i].size;
+        for (int guard = 0; a < end && guard < 64; guard++) {
+            vm_size_t sz = 0;
+            vm_region_extended_info_data_t info;
+            mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
+            mach_port_t object = MACH_PORT_NULL;
+            if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &count, &object) != KERN_SUCCESS || sz == 0)
+                break;
+            resident += (uint64_t)info.pages_resident * vm_page_size;
+            a += sz;
+        }
+        total += resident < spans[i].size ? resident : spans[i].size;
+    }
+    pthread_mutex_lock(&m);
+    cached = total;
+    cached_at = now.tv_sec ? now.tv_sec : 1;
+    pthread_mutex_unlock(&m);
+    return total;
+}
+
+size_t hook_os_proc_available_memory(void) {
+    const size_t real = real_oapm();
+    if (!g_budget_on)
+        return real;
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return real;
+    const uint64_t lent = lent_touched_bytes();
+    const uint64_t used = (uint64_t)info.phys_footprint + lent;
+    const uint64_t soft = g_budget > used ? g_budget - used : 0;
+    const size_t out = soft < real ? (size_t)soft : real;
+
+    g_oapm_calls++;
+    g_last_soft = soft;
+    g_last_real = real;
+    g_last_lent = lent;
+    const int level = out < (512ull << 20) ? 3 : out < (1ull << 30) ? 2 : out < (1536ull << 20) ? 1 : 0;
+    const int previous = g_last_level.exchange(level);
+    if (previous != level && g_level_logs++ < 200)
+        RLOG("pressure level the core sees: %d -> %d (reported headroom %llu MiB, real %llu MiB, footprint %llu MiB, lent in use %llu MiB)",
+             previous, level, mib(out), mib(real), mib(info.phys_footprint), mib(lent));
+    return out;
+}
+
+bool read_budget() {
+    const char *home = getenv("HOME");
+    if (!home)
+        return true;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/Documents/ramhelper.budget", home);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return true; // default on
+    unsigned long long value = 0;
+    const int n = fscanf(f, "%llu", &value);
+    fclose(f);
+    if (n == 1) {
+        if (value == 0)
+            return false;
+        g_budget = value << 20;
+    }
+    return true;
+}
+
 bool read_config() {
     const char *home = getenv("HOME");
     if (!home)
@@ -291,15 +408,19 @@ void *watch_for_core(void *) {
             const char *name = _dyld_get_image_name(i);
             if (!name || !strstr(name, "libRPCS3Core.dylib"))
                 continue;
-            struct rebinding hooks[] = {
-                { "mkstemp", (void *)hook_mkstemp, nullptr },
-                { "ftruncate", (void *)hook_ftruncate, nullptr },
-                { "mmap", (void *)hook_mmap, nullptr },
-                { "close", (void *)hook_close, nullptr },
-            };
-            const int rc = rebind_symbols_image((void *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), hooks,
-                                                sizeof hooks / sizeof hooks[0]);
-            RLOG("hooked the core's mkstemp/ftruncate/mmap/close after %d ms (rc=%d)", waited_ms, rc);
+            struct rebinding hooks[5];
+            int count = 0;
+            if (g_enabled) {
+                hooks[count++] = { "mkstemp", (void *)hook_mkstemp, nullptr };
+                hooks[count++] = { "ftruncate", (void *)hook_ftruncate, nullptr };
+                hooks[count++] = { "mmap", (void *)hook_mmap, nullptr };
+                hooks[count++] = { "close", (void *)hook_close, nullptr };
+            }
+            if (g_budget_on)
+                hooks[count++] = { "os_proc_available_memory", (void *)hook_os_proc_available_memory, nullptr };
+            const int rc = rebind_symbols_image((void *)_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), hooks, count);
+            RLOG("hooked %d imports of the core after %d ms (shm redirect %s, soft budget %s) rc=%d", count, waited_ms,
+                 g_enabled ? "on" : "off", g_budget_on ? "on" : "off", rc);
             return nullptr;
         }
         usleep(50 * 1000);
@@ -344,6 +465,9 @@ extern "C" void ramhelper_log_footprint(void) {
 }
 
 extern "C" void ramhelper_log_stats(void) {
+    if (g_budget_on && g_oapm_calls > 0)
+        RLOG("budget: core asked for headroom %llu times; last reported %llu MiB (real %llu MiB), lent in use %llu MiB",
+             (unsigned long long)g_oapm_calls.load(), mib(g_last_soft), mib(g_last_real), mib(g_last_lent));
     if (!g_enabled)
         return;
     pthread_mutex_lock(&g_lock);
@@ -353,28 +477,42 @@ extern "C" void ramhelper_log_stats(void) {
 }
 
 extern "C" void ramhelper_install(void) {
-    if (!read_config()) {
+    g_budget_on = read_budget();
+    const bool shm_on = read_config();
+    real_oapm = (oapm_fn)dlsym(RTLD_DEFAULT, "os_proc_available_memory");
+    if (!real_oapm)
+        g_budget_on = false;
+    if (!shm_on)
         RLOG("shm redirect is OFF (create Documents/ramhelper.enable in the app's Files folder to turn it on)");
+    if (g_budget_on)
+        RLOG("soft memory budget ON: %llu MiB (Documents/ramhelper.budget changes it, 0 turns it off)", mib(g_budget));
+    else
+        RLOG("soft memory budget is OFF");
+    if (!shm_on && !g_budget_on)
         return;
-    }
-    real_mkstemp = (mkstemp_fn)dlsym(RTLD_DEFAULT, "mkstemp");
-    real_ftruncate = (ftruncate_fn)dlsym(RTLD_DEFAULT, "ftruncate");
-    real_mmap = (mmap_fn)dlsym(RTLD_DEFAULT, "mmap");
-    real_close = (close_fn)dlsym(RTLD_DEFAULT, "close");
-    real_mprotect = (mprotect_fn)dlsym(RTLD_DEFAULT, "mprotect");
-    if (!real_mkstemp || !real_ftruncate || !real_mmap || !real_close || !real_mprotect) {
-        RLOG("FAIL: could not resolve libc functions");
-        return;
-    }
 
-    g_enabled = true;
-    RLOG("shm redirect ON: threshold %llu MiB, cap %llu MiB; waiting for the app to dlopen libRPCS3Core.dylib",
-         mib(g_threshold), mib(g_cap));
+    if (shm_on) {
+        real_mkstemp = (mkstemp_fn)dlsym(RTLD_DEFAULT, "mkstemp");
+        real_ftruncate = (ftruncate_fn)dlsym(RTLD_DEFAULT, "ftruncate");
+        real_mmap = (mmap_fn)dlsym(RTLD_DEFAULT, "mmap");
+        real_close = (close_fn)dlsym(RTLD_DEFAULT, "close");
+        real_mprotect = (mprotect_fn)dlsym(RTLD_DEFAULT, "mprotect");
+        if (!real_mkstemp || !real_ftruncate || !real_mmap || !real_close || !real_mprotect) {
+            RLOG("FAIL: could not resolve libc functions; shm redirect stays off");
+        } else {
+            g_enabled = true;
+            RLOG("shm redirect ON: threshold %llu MiB, cap %llu MiB", mib(g_threshold), mib(g_cap));
+        }
+    }
+    if (!g_enabled && !g_budget_on)
+        return;
+
     pthread_t thread;
     if (pthread_create(&thread, nullptr, watch_for_core, nullptr) == 0) {
         pthread_detach(thread);
     } else {
         g_enabled = false;
+        g_budget_on = false;
         RLOG("FAIL: could not start the watcher thread, nothing hooked");
     }
 }
